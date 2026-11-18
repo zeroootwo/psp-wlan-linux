@@ -1,0 +1,550 @@
+diff -ruN a/Makefile b/Makefile
+--- a/Makefile	2026-11-19 00:32:33.940105588 +0200
++++ b/Makefile	2026-11-19 00:32:33.941019379 +0200
+@@ -412,7 +412,11 @@
+ include $(srctree)/arch/$(ARCH)/Makefile
+ export KBUILD_DEFCONFIG
+ 
+-config %config: scripts_basic outputmakefile FORCE
++%config: scripts_basic outputmakefile FORCE
++	$(Q)mkdir -p include/linux include/config
++	$(Q)$(MAKE) $(build)=scripts/kconfig $@
++
++config: scripts_basic outputmakefile FORCE
+ 	$(Q)mkdir -p include/linux include/config
+ 	$(Q)$(MAKE) $(build)=scripts/kconfig $@
+ 
+@@ -1440,7 +1444,10 @@
+ 	$(Q)$(MAKE) $(build)=$(build-dir) $(target-dir)$(notdir $@)
+ 
+ # Modules
+-/ %/: prepare scripts FORCE
++%/: prepare scripts FORCE
++	$(Q)$(MAKE) KBUILD_MODULES=$(if $(CONFIG_MODULES),1) \
++	$(build)=$(build-dir)
++/: prepare scripts FORCE
+ 	$(Q)$(MAKE) KBUILD_MODULES=$(if $(CONFIG_MODULES),1) \
+ 	$(build)=$(build-dir)
+ %.ko: prepare scripts FORCE
+diff -ruN a/arch/mips/kernel/vmlinux.lds.S b/arch/mips/kernel/vmlinux.lds.S
+--- a/arch/mips/kernel/vmlinux.lds.S	1970-01-01 03:00:00.000000000 +0300
++++ b/arch/mips/kernel/vmlinux.lds.S	2026-11-19 00:32:33.969272402 +0200
+@@ -0,0 +1,168 @@
++#include <asm/asm-offsets.h>
++#include <asm-generic/vmlinux.lds.h>
++
++#undef mips
++#define mips mips
++OUTPUT_ARCH(mips)
++ENTRY(kernel_entry)
++jiffies = JIFFIES;
++SECTIONS
++{
++#ifdef CONFIG_BOOT_ELF64
++  /* Read-only sections, merged into text segment: */
++  /* . = 0xc000000000000000; */
++
++  /* This is the value for an Origin kernel, taken from an IRIX kernel.  */
++  /* . = 0xc00000000001c000; */
++
++  /* Set the vaddr for the text segment to a value
++        >= 0xa800 0000 0001 9000 if no symmon is going to configured
++        >= 0xa800 0000 0030 0000 otherwise  */
++
++  /* . = 0xa800000000300000; */
++  /* . = 0xa800000000300000; */
++  . = 0xffffffff80300000;
++#endif
++  . = LOADADDR;
++  /* read-only */
++  _text = .;			/* Text and read-only data */
++  .text : {
++    TEXT_TEXT
++    SCHED_TEXT
++    LOCK_TEXT
++    *(.fixup)
++    *(.gnu.warning)
++  } =0
++
++  _etext = .;			/* End of text section */
++
++  . = ALIGN(16);		/* Exception table */
++  __start___ex_table = .;
++  __ex_table : { *(__ex_table) }
++  __stop___ex_table = .;
++
++  __start___dbe_table = .;	/* Exception table for data bus errors */
++  __dbe_table : { *(__dbe_table) }
++  __stop___dbe_table = .;
++
++  RODATA
++
++  /* writeable */
++  .data : {			/* Data */
++    . = . + DATAOFFSET;		/* for CONFIG_MAPPED_KERNEL */
++    /*
++     * This ALIGN is needed as a workaround for a bug a gcc bug upto 4.1 which
++     * limits the maximum alignment to at most 32kB and results in the following
++     * warning:
++     *
++     *  CC      arch/mips/kernel/init_task.o
++     * arch/mips/kernel/init_task.c:30: warning: alignment of ‘init_thread_union’
++     * is greater than maximum object file alignment.  Using 32768
++     */
++    . = ALIGN(_PAGE_SIZE);
++    *(.data.init_task)
++
++    DATA_DATA
++
++    CONSTRUCTORS
++  }
++  _gp = . + 0x8000;
++  .lit8 : { *(.lit8) }
++  .lit4 : { *(.lit4) }
++  /* We want the small data sections together, so single-instruction offsets
++     can access them all, and initialized data all before uninitialized, so
++     we can shorten the on-disk segment size.  */
++  .sdata     : { *(.sdata) }
++
++  . = ALIGN(_PAGE_SIZE);
++  __nosave_begin = .;
++  .data_nosave : { *(.data.nosave) }
++  . = ALIGN(_PAGE_SIZE);
++  __nosave_end = .;
++
++  . = ALIGN(32);
++  .data.cacheline_aligned : { *(.data.cacheline_aligned) }
++
++  _edata =  .;			/* End of data section */
++
++  /* will be freed after init */
++  . = ALIGN(_PAGE_SIZE);		/* Init code and data */
++  __init_begin = .;
++  .init.text : {
++	_sinittext = .;
++	*(.init.text)
++	_einittext = .;
++  }
++  .init.data : { *(.init.data) }
++  . = ALIGN(16);
++  __setup_start = .;
++  .init.setup : { *(.init.setup) }
++  __setup_end = .;
++
++  __initcall_start = .;
++  .initcall.init : {
++	INITCALLS
++  }
++  __initcall_end = .;
++
++  __con_initcall_start = .;
++  .con_initcall.init : { *(.con_initcall.init) }
++  __con_initcall_end = .;
++  SECURITY_INIT
++    /* .exit.text is discarded at runtime, not link time, to deal with
++     references from .rodata */
++  .exit.text : { *(.exit.text) }
++  .exit.data : { *(.exit.data) }
++#if defined(CONFIG_BLK_DEV_INITRD)
++  . = ALIGN(_PAGE_SIZE);
++  __initramfs_start = .;
++  .init.ramfs : { *(.init.ramfs) }
++  __initramfs_end = .;
++#endif
++  . = ALIGN(_PAGE_SIZE);
++  __per_cpu_start = .;
++  .data.percpu  : { *(.data.percpu) }
++  __per_cpu_end = .;
++  . = ALIGN(_PAGE_SIZE);
++  __init_end = .;
++  /* freed after init ends here */
++
++  __bss_start = .;		/* BSS */
++  .sbss      : {
++    *(.sbss)
++    *(.scommon)
++  }
++  .bss : {
++    *(.bss)
++    *(COMMON)
++  }
++  __bss_stop = .;
++
++  _end = . ;
++
++  /* Sections to be discarded */
++  /DISCARD/ : {
++        *(.exitcall.exit)
++
++	/* ABI crap starts here */
++	*(.comment)
++	*(.MIPS.options)
++	*(.note)
++	*(.options)
++	*(.pdr)
++	*(.reginfo)
++	*(.mdebug*)
++  }
++
++  /* This is the MIPS specific mdebug section.  */
++  .mdebug : { *(.mdebug) }
++
++  STABS_DEBUG
++
++  DWARF_DEBUG
++
++  /* These must appear regardless of  .  */
++  .gptab.sdata : { *(.gptab.data) *(.gptab.sdata) }
++  .gptab.sbss : { *(.gptab.bss) *(.gptab.sbss) }
++  .note : { *(.note) }
++}
+diff -ruN a/arch/mips/psp/Makefile b/arch/mips/psp/Makefile
+--- a/arch/mips/psp/Makefile	2026-11-19 00:32:33.948559137 +0200
++++ b/arch/mips/psp/Makefile	2026-11-19 00:32:33.949337214 +0200
+@@ -1,7 +1,7 @@
+-#	 A uClinux port for Sony PlayStation Portable
+-#	 Created by Jackson Mo, Aug 29, 2007
+-
+-IPL_SDK_OBJS = cache.o memstk.o psp_uart.o syscon.o sysreg.o
+-lib-$(CONFIG_SONY_PSP) += psp.o psplo.o \
+-	$(addprefix ipl_sdk/,$(IPL_SDK_OBJS))
+-CFLAGS += -I$(CONFIG_PSP_SDK_PATH)/include -I$(CONFIG_PSP_TOOLCHAIN_PATH)/include
++#	 A uClinux port for Sony PlayStation Portable
++#	 Created by Jackson Mo, Aug 29, 2007
++
++IPL_SDK_OBJS = cache.o memstk.o psp_uart.o syscon.o sysreg.o
++lib-$(CONFIG_SONY_PSP) += psp.o psplo.o \
++	$(addprefix ipl_sdk/,$(IPL_SDK_OBJS))
++# (pspsdk headers no longer needed: ipl_sdk uses only kernel types)
+diff -ruN a/arch/mips/psp/ipl_sdk/memstk.c b/arch/mips/psp/ipl_sdk/memstk.c
+--- a/arch/mips/psp/ipl_sdk/memstk.c	2026-11-19 00:32:33.952452056 +0200
++++ b/arch/mips/psp/ipl_sdk/memstk.c	2026-11-19 00:32:33.954249041 +0200
+@@ -5,7 +5,7 @@
+ 	Supported MsProDuo Only.
+ 
+ ****************************************************************************/
+-#include <pspkernel.h>
++#include <linux/types.h>
+ #include <asm/ipl_sdk/Kprintf.h>
+ #include <asm/ipl_sdk/syscon.h>
+ 
+diff -ruN a/arch/mips/psp/ipl_sdk/psp_uart.c b/arch/mips/psp/ipl_sdk/psp_uart.c
+--- a/arch/mips/psp/ipl_sdk/psp_uart.c	2026-11-19 00:32:33.957390854 +0200
++++ b/arch/mips/psp/ipl_sdk/psp_uart.c	2026-11-19 00:32:33.958365619 +0200
+@@ -1,7 +1,7 @@
+ /****************************************************************************
+ 	PSP IPL HP REMOTE UART Driver
+ ****************************************************************************/
+-#include <psptypes.h>
++#include <linux/types.h>
+ #include <asm/ipl_sdk/psp_uart.h>
+ 
+ /*
+diff -ruN a/arch/mips/psp/ipl_sdk/syscon.c b/arch/mips/psp/ipl_sdk/syscon.c
+--- a/arch/mips/psp/ipl_sdk/syscon.c	2026-11-19 00:32:33.961339057 +0200
++++ b/arch/mips/psp/ipl_sdk/syscon.c	2026-11-19 00:32:33.962239844 +0200
+@@ -1,8 +1,9 @@
+ /****************************************************************************
+ 	PSP IPL SYSCON Driver
+ ****************************************************************************/
+-#include <psptypes.h>
+-#include <asm/ipl_sdk/kprintf.h>
++#include <linux/types.h>
++#include <asm/ipl_sdk/psp_compat.h>
++#include <asm/ipl_sdk/Kprintf.h>
+ 
+ #include <asm/ipl_sdk/sysreg.h>
+ #include <asm/ipl_sdk/syscon.h>
+diff -ruN a/arch/mips/psp/ipl_sdk/sysreg.c b/arch/mips/psp/ipl_sdk/sysreg.c
+--- a/arch/mips/psp/ipl_sdk/sysreg.c	2026-11-19 00:32:33.965313590 +0200
++++ b/arch/mips/psp/ipl_sdk/sysreg.c	2026-11-19 00:32:33.966085114 +0200
+@@ -1,8 +1,9 @@
+ /****************************************************************************
+ 	PSP IPL SYSREG Driver
+ ****************************************************************************/
+-#include <psptypes.h>
+-#include <asm/ipl_sdk/kprintf.h>
++#include <linux/types.h>
++#include <asm/ipl_sdk/psp_compat.h>
++#include <asm/ipl_sdk/Kprintf.h>
+ 
+ #define REG32(ADDR) (*(vu32*)(ADDR))
+ #define SYNC() asm(" sync; nop"::)
+diff -ruN a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+--- a/include/asm-generic/vmlinux.lds.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/asm-generic/vmlinux.lds.h	2026-11-19 00:32:33.972369431 +0200
+@@ -0,0 +1,247 @@
++#ifndef LOAD_OFFSET
++#define LOAD_OFFSET 0
++#endif
++
++#ifndef VMLINUX_SYMBOL
++#define VMLINUX_SYMBOL(_sym_) _sym_
++#endif
++
++/* Align . to a 8 byte boundary equals to maximum function alignment. */
++#define ALIGN_FUNCTION()  . = ALIGN(8)
++
++/* .data section */
++#define DATA_DATA							\
++	*(.data)							\
++	*(.data.init.refok)
++
++#define RO_DATA(align)							\
++	. = ALIGN((align));						\
++	.rodata           : AT(ADDR(.rodata) - LOAD_OFFSET) {		\
++		VMLINUX_SYMBOL(__start_rodata) = .;			\
++		*(.rodata) *(.rodata.*)					\
++		*(__vermagic)		/* Kernel version magic */	\
++	}								\
++									\
++	.rodata1          : AT(ADDR(.rodata1) - LOAD_OFFSET) {		\
++		*(.rodata1)						\
++	}								\
++									\
++	/* PCI quirks */						\
++	.pci_fixup        : AT(ADDR(.pci_fixup) - LOAD_OFFSET) {	\
++		VMLINUX_SYMBOL(__start_pci_fixups_early) = .;		\
++		*(.pci_fixup_early)					\
++		VMLINUX_SYMBOL(__end_pci_fixups_early) = .;		\
++		VMLINUX_SYMBOL(__start_pci_fixups_header) = .;		\
++		*(.pci_fixup_header)					\
++		VMLINUX_SYMBOL(__end_pci_fixups_header) = .;		\
++		VMLINUX_SYMBOL(__start_pci_fixups_final) = .;		\
++		*(.pci_fixup_final)					\
++		VMLINUX_SYMBOL(__end_pci_fixups_final) = .;		\
++		VMLINUX_SYMBOL(__start_pci_fixups_enable) = .;		\
++		*(.pci_fixup_enable)					\
++		VMLINUX_SYMBOL(__end_pci_fixups_enable) = .;		\
++		VMLINUX_SYMBOL(__start_pci_fixups_resume) = .;		\
++		*(.pci_fixup_resume)					\
++		VMLINUX_SYMBOL(__end_pci_fixups_resume) = .;		\
++	}								\
++									\
++	/* RapidIO route ops */						\
++	.rio_route        : AT(ADDR(.rio_route) - LOAD_OFFSET) {	\
++		VMLINUX_SYMBOL(__start_rio_route_ops) = .;		\
++		*(.rio_route_ops)					\
++		VMLINUX_SYMBOL(__end_rio_route_ops) = .;		\
++	}								\
++									\
++	/* Kernel symbol table: Normal symbols */			\
++	__ksymtab         : AT(ADDR(__ksymtab) - LOAD_OFFSET) {		\
++		VMLINUX_SYMBOL(__start___ksymtab) = .;			\
++		*(__ksymtab)						\
++		VMLINUX_SYMBOL(__stop___ksymtab) = .;			\
++	}								\
++									\
++	/* Kernel symbol table: GPL-only symbols */			\
++	__ksymtab_gpl     : AT(ADDR(__ksymtab_gpl) - LOAD_OFFSET) {	\
++		VMLINUX_SYMBOL(__start___ksymtab_gpl) = .;		\
++		*(__ksymtab_gpl)					\
++		VMLINUX_SYMBOL(__stop___ksymtab_gpl) = .;		\
++	}								\
++									\
++	/* Kernel symbol table: Normal unused symbols */		\
++	__ksymtab_unused  : AT(ADDR(__ksymtab_unused) - LOAD_OFFSET) {	\
++		VMLINUX_SYMBOL(__start___ksymtab_unused) = .;		\
++		*(__ksymtab_unused)					\
++		VMLINUX_SYMBOL(__stop___ksymtab_unused) = .;		\
++	}								\
++									\
++	/* Kernel symbol table: GPL-only unused symbols */		\
++	__ksymtab_unused_gpl : AT(ADDR(__ksymtab_unused_gpl) - LOAD_OFFSET) { \
++		VMLINUX_SYMBOL(__start___ksymtab_unused_gpl) = .;	\
++		*(__ksymtab_unused_gpl)					\
++		VMLINUX_SYMBOL(__stop___ksymtab_unused_gpl) = .;	\
++	}								\
++									\
++	/* Kernel symbol table: GPL-future-only symbols */		\
++	__ksymtab_gpl_future : AT(ADDR(__ksymtab_gpl_future) - LOAD_OFFSET) { \
++		VMLINUX_SYMBOL(__start___ksymtab_gpl_future) = .;	\
++		*(__ksymtab_gpl_future)					\
++		VMLINUX_SYMBOL(__stop___ksymtab_gpl_future) = .;	\
++	}								\
++									\
++	/* Kernel symbol table: Normal symbols */			\
++	__kcrctab         : AT(ADDR(__kcrctab) - LOAD_OFFSET) {		\
++		VMLINUX_SYMBOL(__start___kcrctab) = .;			\
++		*(__kcrctab)						\
++		VMLINUX_SYMBOL(__stop___kcrctab) = .;			\
++	}								\
++									\
++	/* Kernel symbol table: GPL-only symbols */			\
++	__kcrctab_gpl     : AT(ADDR(__kcrctab_gpl) - LOAD_OFFSET) {	\
++		VMLINUX_SYMBOL(__start___kcrctab_gpl) = .;		\
++		*(__kcrctab_gpl)					\
++		VMLINUX_SYMBOL(__stop___kcrctab_gpl) = .;		\
++	}								\
++									\
++	/* Kernel symbol table: Normal unused symbols */		\
++	__kcrctab_unused  : AT(ADDR(__kcrctab_unused) - LOAD_OFFSET) {	\
++		VMLINUX_SYMBOL(__start___kcrctab_unused) = .;		\
++		*(__kcrctab_unused)					\
++		VMLINUX_SYMBOL(__stop___kcrctab_unused) = .;		\
++	}								\
++									\
++	/* Kernel symbol table: GPL-only unused symbols */		\
++	__kcrctab_unused_gpl : AT(ADDR(__kcrctab_unused_gpl) - LOAD_OFFSET) { \
++		VMLINUX_SYMBOL(__start___kcrctab_unused_gpl) = .;	\
++		*(__kcrctab_unused_gpl)					\
++		VMLINUX_SYMBOL(__stop___kcrctab_unused_gpl) = .;	\
++	}								\
++									\
++	/* Kernel symbol table: GPL-future-only symbols */		\
++	__kcrctab_gpl_future : AT(ADDR(__kcrctab_gpl_future) - LOAD_OFFSET) { \
++		VMLINUX_SYMBOL(__start___kcrctab_gpl_future) = .;	\
++		*(__kcrctab_gpl_future)					\
++		VMLINUX_SYMBOL(__stop___kcrctab_gpl_future) = .;	\
++	}								\
++									\
++	/* Kernel symbol table: strings */				\
++        __ksymtab_strings : AT(ADDR(__ksymtab_strings) - LOAD_OFFSET) {	\
++		*(__ksymtab_strings)					\
++	}								\
++									\
++	/* Built-in module parameters. */				\
++	__param : AT(ADDR(__param) - LOAD_OFFSET) {			\
++		VMLINUX_SYMBOL(__start___param) = .;			\
++		*(__param)						\
++		VMLINUX_SYMBOL(__stop___param) = .;			\
++		VMLINUX_SYMBOL(__end_rodata) = .;			\
++	}								\
++									\
++	. = ALIGN((align));
++
++/* RODATA provided for backward compatibility.
++ * All archs are supposed to use RO_DATA() */
++#define RODATA RO_DATA(4096)
++
++#define SECURITY_INIT							\
++	.security_initcall.init : AT(ADDR(.security_initcall.init) - LOAD_OFFSET) { \
++		VMLINUX_SYMBOL(__security_initcall_start) = .;		\
++		*(.security_initcall.init) 				\
++		VMLINUX_SYMBOL(__security_initcall_end) = .;		\
++	}
++
++/* .text section. Map to function alignment to avoid address changes
++ * during second ld run in second ld pass when generating System.map */
++#define TEXT_TEXT							\
++		ALIGN_FUNCTION();					\
++		*(.text)						\
++		*(.text.init.refok)
++
++/* sched.text is aling to function alignment to secure we have same
++ * address even at second ld pass when generating System.map */
++#define SCHED_TEXT							\
++		ALIGN_FUNCTION();					\
++		VMLINUX_SYMBOL(__sched_text_start) = .;			\
++		*(.sched.text)						\
++		VMLINUX_SYMBOL(__sched_text_end) = .;
++
++/* spinlock.text is aling to function alignment to secure we have same
++ * address even at second ld pass when generating System.map */
++#define LOCK_TEXT							\
++		ALIGN_FUNCTION();					\
++		VMLINUX_SYMBOL(__lock_text_start) = .;			\
++		*(.spinlock.text)					\
++		VMLINUX_SYMBOL(__lock_text_end) = .;
++
++#define KPROBES_TEXT							\
++		ALIGN_FUNCTION();					\
++		VMLINUX_SYMBOL(__kprobes_text_start) = .;		\
++		*(.kprobes.text)					\
++		VMLINUX_SYMBOL(__kprobes_text_end) = .;
++
++		/* DWARF debug sections.
++		Symbols in the DWARF debugging sections are relative to
++		the beginning of the section so we begin them at 0.  */
++#define DWARF_DEBUG							\
++		/* DWARF 1 */						\
++		.debug          0 : { *(.debug) }			\
++		.line           0 : { *(.line) }			\
++		/* GNU DWARF 1 extensions */				\
++		.debug_srcinfo  0 : { *(.debug_srcinfo) }		\
++		.debug_sfnames  0 : { *(.debug_sfnames) }		\
++		/* DWARF 1.1 and DWARF 2 */				\
++		.debug_aranges  0 : { *(.debug_aranges) }		\
++		.debug_pubnames 0 : { *(.debug_pubnames) }		\
++		/* DWARF 2 */						\
++		.debug_info     0 : { *(.debug_info			\
++				.gnu.linkonce.wi.*) }			\
++		.debug_abbrev   0 : { *(.debug_abbrev) }		\
++		.debug_line     0 : { *(.debug_line) }			\
++		.debug_frame    0 : { *(.debug_frame) }			\
++		.debug_str      0 : { *(.debug_str) }			\
++		.debug_loc      0 : { *(.debug_loc) }			\
++		.debug_macinfo  0 : { *(.debug_macinfo) }		\
++		/* SGI/MIPS DWARF 2 extensions */			\
++		.debug_weaknames 0 : { *(.debug_weaknames) }		\
++		.debug_funcnames 0 : { *(.debug_funcnames) }		\
++		.debug_typenames 0 : { *(.debug_typenames) }		\
++		.debug_varnames  0 : { *(.debug_varnames) }		\
++
++		/* Stabs debugging sections.  */
++#define STABS_DEBUG							\
++		.stab 0 : { *(.stab) }					\
++		.stabstr 0 : { *(.stabstr) }				\
++		.stab.excl 0 : { *(.stab.excl) }			\
++		.stab.exclstr 0 : { *(.stab.exclstr) }			\
++		.stab.index 0 : { *(.stab.index) }			\
++		.stab.indexstr 0 : { *(.stab.indexstr) }		\
++		.comment 0 : { *(.comment) }
++
++#define BUG_TABLE							\
++	. = ALIGN(8);							\
++	__bug_table : AT(ADDR(__bug_table) - LOAD_OFFSET) {		\
++		__start___bug_table = .;				\
++		*(__bug_table)						\
++		__stop___bug_table = .;					\
++	}
++
++#define NOTES								\
++	.notes : { *(.note.*) } :note
++
++#define INITCALLS							\
++  	*(.initcall0.init)						\
++  	*(.initcall0s.init)						\
++  	*(.initcall1.init)						\
++  	*(.initcall1s.init)						\
++  	*(.initcall2.init)						\
++  	*(.initcall2s.init)						\
++  	*(.initcall3.init)						\
++  	*(.initcall3s.init)						\
++  	*(.initcall4.init)						\
++  	*(.initcall4s.init)						\
++  	*(.initcall5.init)						\
++  	*(.initcall5s.init)						\
++	*(.initcallrootfs.init)						\
++  	*(.initcall6.init)						\
++  	*(.initcall6s.init)						\
++  	*(.initcall7.init)						\
++  	*(.initcall7s.init)
++
+diff -ruN a/include/asm-mips/ipl_sdk/psp_compat.h b/include/asm-mips/ipl_sdk/psp_compat.h
+--- a/include/asm-mips/ipl_sdk/psp_compat.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/asm-mips/ipl_sdk/psp_compat.h	2026-11-19 00:32:33.975573431 +0200
+@@ -0,0 +1,12 @@
++#ifndef __PSP_COMPAT_H__
++#define __PSP_COMPAT_H__
++
++/* Volatile register types that the old pspsdk psptypes.h used to provide. */
++#include <linux/types.h>
++
++typedef volatile u8   vu8;
++typedef volatile u16  vu16;
++typedef volatile u32  vu32;
++typedef volatile u64  vu64;
++
++#endif
+diff -ruN a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig	2026-11-19 00:32:33.944345407 +0200
++++ b/net/Kconfig	2026-11-19 00:32:33.945267894 +0200
+@@ -213,7 +213,6 @@
+ source "net/irda/Kconfig"
+ source "net/bluetooth/Kconfig"
+ source "net/rxrpc/Kconfig"
+-source "../openswan/linux/net/ipsec/Kconfig"
+ 
+ config FIB_RULES
+ 	bool

@@ -1,0 +1,27 @@
+diff -ruN a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+--- a/drivers/misc/Kconfig	2026-11-19 00:32:33.982084523 +0200
++++ b/drivers/misc/Kconfig	2026-11-19 00:32:33.982918935 +0200
+@@ -188,4 +188,15 @@
+ 	  If you are not sure, say Y here.
+ 
+ 
++config PSP_WLAN_PROBE
++	bool "PSP WLAN bring-up probe (experimental)"
++	depends on SONY_PSP && PROC_FS
++	default n
++	---help---
++	  Adds /proc/psp_wlan. Writing "go" powers up the PSP-3000 WLAN chip
++	  using the sequence reverse-engineered from the Sony firmware and
++	  reads two chip registers; reading shows the log. Experimental and
++	  untested on hardware.
++
++
+ endmenu
+diff -ruN a/drivers/misc/Makefile b/drivers/misc/Makefile
+--- a/drivers/misc/Makefile	2026-11-19 00:32:33.985975669 +0200
++++ b/drivers/misc/Makefile	2026-11-19 00:32:33.986795143 +0200
+@@ -14,3 +14,4 @@
+ obj-$(CONFIG_SGI_IOC4)		+= ioc4.o
+ obj-$(CONFIG_SONY_LAPTOP)	+= sony-laptop.o
+ obj-$(CONFIG_THINKPAD_ACPI)	+= thinkpad_acpi.o
++obj-$(CONFIG_PSP_WLAN_PROBE)	+= psp_wlan_probe.o

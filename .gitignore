@@ -1,0 +1,15 @@
+# build products and secrets never belong here
+*.o
+*.elf
+*.gdb
+*.bflt
+*.prx
+vmlinux*
+/tools/pnet/wpa_test
+/tools/pnet/pnet
+/wpa.conf
+/card/wpa.conf
+fwh.bin
+fwm.bin
+wlanlog.bin
+*.log

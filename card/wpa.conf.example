@@ -1,0 +1,3 @@
+# Copy to /wpa.conf on the memory stick and edit.  Remove the psk line for an open network.
+ssid=MyNetwork
+psk=my passphrase
