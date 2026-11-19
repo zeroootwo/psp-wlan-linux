@@ -53,10 +53,11 @@ sh /ms0/net/shell-loop.sh &
 pnet serve 2323 /ms0/net/shell.key /dev/psh_in /dev/psh_out wlan0 > /ms0/net/serve.log 2>&1 &
 echo "== remote access listening on port 2323"
 fi
-sh /ms0/net/diag.sh > /ms0/diag.txt 2>&1
 if [ -f /ms0/net/nosup ]; then
 echo "== supervisor NOT started (net/nosup present)"
 else
 echo "== supervisor started (log: /ms0/net/wifi.log)"
 pnet connect wlan0 /ms0/wpa.conf > /ms0/net/wifi.log 2>&1 &
 fi
+# diagnostics dump (about 1 s of shell work) runs in the background so it does not delay the connection
+sh /ms0/net/diag.sh > /ms0/diag.txt 2>&1 &

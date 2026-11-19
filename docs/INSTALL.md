@@ -18,6 +18,8 @@ homebrew in kernel mode (the stock uClinux loader is a CFW homebrew). Nothing is
 ```
 
 `wpa.conf` is plain text: `ssid=...` and `psk=...` (the passphrase, 8-63 characters). Omit the `psk` line for an open network.
+An optional `pmk=...` line (64 hex digits, how to compute it is in `card/wpa.conf.example`) skips the 2 s key derivation at boot; with `pmk` alone the passphrase can be left out.
+A `pmk` is as sensitive as the passphrase.
 The file contains your Wi-Fi password: keep it off the internet.
 
 ## Run

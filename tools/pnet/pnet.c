@@ -607,12 +607,16 @@ static void install_variant(int v, const u8 *tk, const u8 *gtk, int gtklen, int 
 	}
 }
 
-static int read_conf(const char *path, char *ssid, int ssz, char *psk, int psz)
+static int unhex1(int c);
+
+/* pmk (optional, 64 hex digits): the precomputed pairwise master key for ssid+psk; saves the 2 s PBKDF2 at every boot */
+static int read_conf(const char *path, char *ssid, int ssz, char *psk, int psz, u8 *pmk, int *have_pmk)
 {
 	char line[200];
 	FILE *f = fopen(path, "r");
 
 	ssid[0] = psk[0] = 0;
+	*have_pmk = 0;
 	if (!f) {
 		perror(path);
 		return -1;
@@ -626,8 +630,26 @@ static int read_conf(const char *path, char *ssid, int ssz, char *psk, int psz)
 			strncpy(ssid, line + 5, ssz - 1);
 		else if (!strncmp(line, "psk=", 4))
 			strncpy(psk, line + 4, psz - 1);
+		else if (!strncmp(line, "pmk=", 4) && strlen(line + 4) >= 64) {
+			int i, ok = 1;
+
+			for (i = 0; i < 32; i++) {
+				int hi = unhex1(line[4 + 2 * i]), lo = unhex1(line[5 + 2 * i]);
+
+				if (hi < 0 || lo < 0) {
+					ok = 0;
+					break;
+				}
+				pmk[i] = hi << 4 | lo;
+			}
+			*have_pmk = ok;
+		}
 	}
 	fclose(f);
+	if (*have_pmk && !psk[0]) {			/* pmk only: the key is all we need, the text just marks the network as secured */
+		strcpy(psk, "(pmk)");
+		return ssid[0] ? 0 : -1;
+	}
 	return ssid[0] && psk[0] ? 0 : -1;
 }
 
@@ -782,12 +804,14 @@ static int do_wpa(const char *ifname, const char *conf, int variant)
 {
 	char ssid[40], psk[80];
 	u8 pmk[32];
+	int have_pmk;
 
-	if (read_conf(conf, ssid, sizeof(ssid), psk, sizeof(psk)) < 0) {
+	if (read_conf(conf, ssid, sizeof(ssid), psk, sizeof(psk), pmk, &have_pmk) < 0) {
 		printf("wpa: bad config %s\n", conf);
 		return 1;
 	}
-	wpa_pmk(psk, (u8 *)ssid, strlen(ssid), pmk);
+	if (!have_pmk)
+		wpa_pmk(psk, (u8 *)ssid, strlen(ssid), pmk);
 	return wpa_handshake(ifname, pmk, default_rsn, 22, 4, variant, 25);
 }
 
@@ -971,16 +995,19 @@ static int do_connect(const char *ifname, const char *conf)
 {
 	char ssid[40], psk[80];
 	u8 pmk[32];
-	int fails = 0, ntp_done = 0;
+	int fails = 0, ntp_done = 0, have_pmk = 0, cached = 0;
 
-	if (read_conf(conf, ssid, sizeof(ssid), psk, sizeof(psk)) < 0 && !ssid[0]) {
-		printf("connect: bad config %s (need ssid=, optional psk=)\n", conf);
+	if (read_conf(conf, ssid, sizeof(ssid), psk, sizeof(psk), pmk, &have_pmk) < 0 && !ssid[0]) {
+		printf("connect: bad config %s (need ssid=, optional psk= / pmk=)\n", conf);
 		return 1;
 	}
 	LOGT("connect: ssid '%s' %s\n", ssid, psk[0] ? "WPA2-PSK" : "open");
-	if (psk[0])
+	if (have_pmk) {
+		cached = 1;				/* precomputed key from wpa.conf: no PBKDF2 at boot */
+	} else if (psk[0]) {
 		wpa_pmk(psk, (u8 *)ssid, strlen(ssid), pmk);
-	LOGT("connect: PMK ready\n");
+	}
+	LOGT("connect: PMK ready%s\n", cached ? " (cached)" : "");
 	for (;;) {
 		long up_t, lease_t;
 		uint32_t myip, gw;
@@ -989,6 +1016,11 @@ static int do_connect(const char *ifname, const char *conf)
 		if (connect_once(ifname, ssid, psk, pmk)) {
 			int wait = ++fails * 5;
 
+			if (cached && fails >= 2 && strcmp(psk, "(pmk)")) {	/* stale key (password changed?): derive it again */
+				wpa_pmk(psk, (u8 *)ssid, strlen(ssid), pmk);
+				cached = 0;
+				LOGT("cached PMK did not work, derived from psk\n");
+			}
 			if (wait > 30)
 				wait = 30;
 			LOGT("attempt failed (%d in a row), retry in %d s\n", fails, wait);
