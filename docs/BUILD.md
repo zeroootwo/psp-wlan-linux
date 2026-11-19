@@ -1,8 +1,9 @@
 # Building
 
-Everything below was done for real while preparing this repository: the kernel in step 4 was built from a pristine
-copy of the upstream sources with exactly these patches, and its WLAN driver object is byte-identical to the one that
-runs on our PSP.
+Everything below was done for real while preparing this repository: a clean checkout of this repository was used to build
+`pnet` and the kernel (from a pristine copy of the upstream sources with exactly these three patches and the driver file
+from `kernel/drivers/misc/`), and `selftest.py` passes. The kernel image built this way has not been booted as such: the one
+we run on our PSP was built in our development tree from the same sources.
 
 ## 0. What you need
 
