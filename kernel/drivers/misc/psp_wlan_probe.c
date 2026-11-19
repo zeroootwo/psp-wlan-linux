@@ -1,28 +1,26 @@
 /*
- * pspwave: PSP-3000 WLAN driver (a Marvell-style ARM WLAN chip, probably the 88W8380 family, behind Memory Stick host #2).
+ * PSP WLAN bring-up probe (experimental).
  *
  * Copyright (C) 2026 Anastasiia Velikaya
  * Licensed under the GNU General Public License, version 2.
  *
- * Polled (IRQ 8 is deliberately not used).  Everything is driven through
- * /proc/psp_wlan (write a command, read the log back); the firmware images go
- * through /proc/psp_fwh and /proc/psp_fwm.  All protocol constants come from
- * observing the stock Sony driver talking to the chip; see docs/PROTOCOL.md.
+ * Reproduces, on demand, what the Sony 6.61 wlan.prx driver does for the
+ * WLAN chip: power-up/reset, then the two-stage firmware download, using
+ * polled MS2 host transfers.  All constants come from the reverse
+ * engineering notes in ~/psp-tools/re/NOTES.md (Parts 3-9).
  *
- * Bring-up order (see card/start.sh):
- *   go        power up, reset, read the chip signature
- *   init      chip register init
- *   (cat helper image > /proc/psp_fwh, main image > /proc/psp_fwm)
- *   fw        two-stage firmware download
- *   chipinit  host command sequence that follows firmware start-up
- *   link <wpa|open> <ssid>   directed scan + (auth, assoc [+ RSN IE]); prints LINK_OK / LINK_FAIL
- *   netup     register the wlan0 net_device and start the polling thread
- *   netdown   unregister it
- * Debugging helpers: rd/wr <reg> [val], gi, info, scan, cmd, cmdx <id> <len> <bytes>, auth, assoc,
- * dhcp, rx, regs, swap, exp.
+ *   /proc/psp_wlan   control + log
+ *       go            power up, reset, read GET_INT and chip regs 0x22/0x24
+ *       off           power down
+ *       rd <hexaddr>  read 1 byte chip register      (log shows the value)
+ *       wr <hexaddr> <hexval>  write 1 byte chip register
+ *       gi            GET_INT
+ *       fw            download helper + main firmware (run "go" first)
+ *   /proc/psp_fwh    write the 2140-byte helper image here (cat file >)
+ *   /proc/psp_fwm    write the 95228-byte main image here
+ *       (write the 4 bytes "clr\n" first to restart an image)
  *
- * Do not use floating point in programs that run on this kernel: the first FPU instruction
- * executed from userland freezes the machine (see docs/TROUBLESHOOTING.md).
+ * The WLAN interrupt (IRQ 8) is deliberately NOT enabled: all polled.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -38,6 +36,12 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
+#include <linux/mm.h>
+#include <asm/div64.h>
+#include <linux/bootmem.h>
+#include <linux/swap.h>
+#include <asm/bootinfo.h>
+#include <asm/mipsregs.h>
 #include <linux/jiffies.h>
 #include <asm/uaccess.h>
 #include <asm/ipl_sdk/psp_compat.h>
@@ -77,6 +81,34 @@ static char logbuf[LOGSZ];
 static int  loglen;
 static int  powered;
 static int  wr_swap = 1;	/* byte-swap every 32-bit word in PIO page writes (required) */
+
+/* Run-time tunables (write "tune <name> <value>" to /proc/psp_wlan).  Defaults keep the original slow, safe behaviour. */
+static int t_int_us = 700;	/* gap between INT polls inside a block transfer (us) */
+static int t_stop_ms = 2;	/* sleep after the STOP command of a block transfer (ms, 0 = none) */
+static int t_ack_ms = 2;	/* sleep after acknowledging a command response (ms, 0 = none) */
+static int t_resp_us = 0;	/* 0: sleep 10 ms between command response polls, else busy-poll gap in us */
+static int t_poll_ms = 10;	/* wlan0 thread: longest wait between chip polls (ms; the timer tick is 4 ms) */
+static int t_idle_ms = 1;	/* wlan0 thread: sleep after each pass (ms, 0 = just yield) */
+static int t_fw_wait_ms = 20;	/* per-block wait for the chip "ready" bit in the firmware loader (always times out) */
+static int t_fw_us = 0;		/* 0: sleep-based waits in the firmware loader, else busy-poll gap in us */
+
+static unsigned long long st_rx_us, st_tx_us, st_rx_n, st_tx_n, st_rx_bytes, st_tx_bytes, st_polls;
+
+static unsigned long long avg_us(unsigned long long us, unsigned long long n)
+{
+	if (!n)
+		return 0;
+	do_div(us, (u32)n);
+	return us;
+}
+
+static unsigned long long now_us(void)
+{
+	struct timeval tv;
+
+	do_gettimeofday(&tv);
+	return (unsigned long long)tv.tv_sec * 1000000ULL + tv.tv_usec;
+}
 
 static u8 *fwh, *fwm;
 static int fwh_len, fwm_len;
@@ -322,7 +354,7 @@ static int ms_write_page(const u8 *p, int len)
 	return ms_end(0);
 }
 
-/* what the stock driver does to the hardware for its DMA mode switch: bit0 = read-dma enable,
+/* what wlan.prx FUN_00008f80 does to the hardware: bit0 = read-dma enable,
  * bit1 = write-dma enable (REG40 bits 0x20 / 0x400, 0x10000 = latch) */
 static void ms_dma_mode(int mode)
 {
@@ -380,7 +412,7 @@ static void dbg_int(const char *tag)
 	     tag, gr, g & 0xff, R32(MS_STATUS));
 }
 
-/* block write to chip address 0x100 ("data port"),  */
+/* block write to chip address 0x100 ("data port"), wlan.prx FUN_0000c6a8 */
 static u32 blk_wr_addr = 0x100;
 
 static int blk_write(const u8 *buf, int len)
@@ -406,20 +438,27 @@ static int blk_write(const u8 *buf, int len)
 		 * the INT register directly (any of CMDNK/data/0x60 bits). */
 		iv = 0;
 		r = 0;
-		for (t = 0; t < 1500; t++) {
-			if (R32(MS_STATUS) & ST_INT) {
+		{
+			unsigned long tmo = jiffies + HZ + 1;
+
+			for (t = 0;; t++) {
+				if (R32(MS_STATUS) & ST_INT) {
+					r = ms_get_int(&iv);
+					got = 1;
+					break;
+				}
 				r = ms_get_int(&iv);
-				got = 1;
-				break;
+				if (r)
+					break;
+				if (iv & 0x71) {
+					got = 1;
+					break;
+				}
+				if (time_after(jiffies, tmo))
+					break;
+				if (t_int_us)
+					udelay(t_int_us);
 			}
-			r = ms_get_int(&iv);
-			if (r)
-				break;
-			if (iv & 0x71) {
-				got = 1;
-				break;
-			}
-			udelay(700);
 		}
 		iv &= 0xff;
 		if (r) {
@@ -469,9 +508,10 @@ static int blk_write(const u8 *buf, int len)
 		logf("   blk: ended early INT=%02x sent %d/%d\n", iv, sent, len);
 		return -14;
 	}
-	/* the stock driver finishes with EX_SET_CMD 0x25 (STOP) */
+	/* wlan.prx FUN_0000c6a8 state 'c8b4': finish with EX_SET_CMD 0x25 (STOP) */
 	r = ms_ex_set_cmd(0x25, 0);
-	msleep(2);
+	if (t_stop_ms)
+		msleep(t_stop_ms);
 	ms_get_int(&iv);
 	if (r) {
 		logf("   blk: STOP -> %d\n", r);
@@ -480,7 +520,7 @@ static int blk_write(const u8 *buf, int len)
 	return 0;
 }
 
-/* polled wait until the chip reports reg 0x54 bit2.
+/* wlan.prx FUN_000138c0, polled: wait until the chip reports reg 0x54 bit2.
  * Sony waits for the INT line between iterations; we poll reg 0x54. */
 static int chip_wait_ready(int ms)
 {
@@ -495,8 +535,11 @@ static int chip_wait_ready(int ms)
 			return 0;
 		if (wr8(0x56, 4))
 			return -1;
-		for (t = 0; t < ms / 10 + 1; t++) {
-			msleep(10);
+		for (t = 0; t < (t_fw_us ? ms * 1000 / t_fw_us + 1 : ms / 10 + 1); t++) {
+			if (t_fw_us)
+				udelay(t_fw_us);
+			else
+				msleep(10);
 			if (ms_get_int(&iv))
 				return -3;
 			if (rd8(0x54, &s))
@@ -508,7 +551,7 @@ static int chip_wait_ready(int ms)
 	return -4;
 }
 
-/*  */
+/* wlan.prx FUN_0000f228 */
 static int send_block(const u8 *buf, int len)
 {
 	int r;
@@ -519,9 +562,9 @@ static int send_block(const u8 *buf, int len)
 		return r;
 	}
 	ms_dma_mode(1);
-	r = chip_wait_ready(20);
+	r = chip_wait_ready(t_fw_wait_ms);
 	if (r) {
-		/* the stock driver does the same: on a ready timeout it rewrites reg
+		/* wlan.prx does the same: on a ready timeout it rewrites reg
 		 * 0x44 and sends the block anyway */
 		r = wr16(0x44, len);
 		if (r) {
@@ -720,7 +763,7 @@ static void run_fw(void)
 			if (off >= MAIN_LEN)
 				break;
 		}
-		for (tries = 0; tries < 1000; tries++) {
+		for (tries = 0; tries < (t_fw_us ? 1000000 / t_fw_us : 1000); tries++) {
 			r = rd16(0x4c, &c);
 			if (r) {
 				logf("fw: rd 0x4c -> %d\n", r);
@@ -728,7 +771,10 @@ static void run_fw(void)
 			}
 			if (c)
 				break;
-			msleep(1);
+			if (t_fw_us)
+				udelay(t_fw_us);
+			else
+				msleep(1);
 		}
 		if (!c) {
 			logf("fw: reg 0x4c stayed 0 at off=%d\n", off);
@@ -830,7 +876,7 @@ static void run_exp(void)
 	ms_dma_mode(3);
 }
 
-/* The stock driver's HAL thread does this chip register init that must
+/* wlan.prx SceWlanHal thread entry (0x95c0): chip register init that must
  * happen before the chip accepts any block command.  Verbose, stops at the
  * first failing step so we can see where the bus dies. */
 #define ISTEP(tag, expr) do { \
@@ -856,7 +902,7 @@ static int hal_init(void)
 	ISTEP("2 rd22", rd8(0x22, &v));
 	logf("  22=%02x\n", v);
 	ISTEP("3 wr10=7f", wr8(0x10, 0x7f));
-	/* the stock driver then puts the chip in fast mode, switch the
+	/* wlan.prx FUN_00009098(host,1): chip now runs in fast mode, switch the
 	 * host to match: SYS &= ~0x4010, MS2 clksel = 1; delaysel comes from an
 	 * unknown config, so scan it and keep the first value that works. */
 	rmw(MS_SYS, 0x4010, 0);
@@ -911,7 +957,7 @@ static int hal_init(void)
 	return 0;
 }
 
-/* PIO page read (TPC 0x5),  */
+/* PIO page read (TPC 0x5), wlan.prx FUN_0000a438 */
 static int ms_read_page(u8 *p, int len)
 {
 	u32 tmp[0x82];
@@ -945,7 +991,7 @@ static int ms_read_page(u8 *p, int len)
 	return 0;
 }
 
-/* block read from chip address addr (cmd 0xB2) */
+/* block read from chip address addr (wlan.prx FUN_0000be74, cmd 0xB2) */
 static int blk_read(u8 *buf, int len, u32 addr, u8 cmdb)
 {
 	u32 w0, w1, iv = 0;
@@ -962,17 +1008,24 @@ static int blk_read(u8 *buf, int len, u32 addr, u8 cmdb)
 	page = len < 0x200 ? len : 0x200;
 	while (got < len) {
 		ev = 0;
-		for (t = 0; t < 1500; t++) {
-			r = ms_get_int(&iv);
-			if (r) {
-				logf("   rd: GET_INT -> %d\n", r);
-				return r;
+		{
+			unsigned long tmo = jiffies + HZ + 1;
+
+			for (t = 0;; t++) {
+				r = ms_get_int(&iv);
+				if (r) {
+					logf("   rd: GET_INT -> %d\n", r);
+					return r;
+				}
+				if (iv & 0x71) {
+					ev = 1;
+					break;
+				}
+				if (time_after(jiffies, tmo))
+					break;
+				if (t_int_us)
+					udelay(t_int_us);
 			}
-			if (iv & 0x71) {
-				ev = 1;
-				break;
-			}
-			udelay(700);
 		}
 		iv &= 0xff;
 		if (!ev) {
@@ -997,7 +1050,8 @@ static int blk_read(u8 *buf, int len, u32 addr, u8 cmdb)
 		return -12;
 	}
 	ms_ex_set_cmd(0x25, 0);
-	msleep(2);
+	if (t_stop_ms)
+		msleep(t_stop_ms);
 	ms_get_int(&iv);
 	return 0;
 }
@@ -1048,7 +1102,7 @@ static int fw_read_resp(u16 *rlenp, int quiet)
 	r = blk_read(rbuf, (rlen + 3) & ~3, 0x100, 0xb3);
 	ms_dma_mode(3);
 	if (!r && rlen >= 0x16 && rbuf[0] == 0x03 && rbuf[1] == 0x80)
-		memcpy(psp_mac, rbuf + 16, 6);	/* the chip reports its own MAC here */
+		memcpy(psp_mac, rbuf + 16, 6);	/* seen in Sony log: 00:23:4d:51:57:70 */
 	return r;
 }
 
@@ -1067,7 +1121,8 @@ static int fw_xfer(const u8 *cb, int len, u16 *rlenp, int tmo)
 			break;
 		r = fw_read_resp(&rlen, 1);
 		wr8(0x56, 0x10);
-		msleep(2);
+		if (t_ack_ms)
+			msleep(t_ack_ms);
 		logf("drained stale resp len=%04x (%d) cmd=%04x\n", rlen, r,
 		     rbuf[0] | rbuf[1] << 8);
 	}
@@ -1082,11 +1137,18 @@ static int fw_xfer(const u8 *cb, int len, u16 *rlenp, int tmo)
 		logf("send -> %d\n", r);
 		return r;
 	}
-	for (t = 0; t < tmo; t++) {
-		rd8(0x54, &s54);
-		if (s54 & 0x10)
-			break;
-		msleep(10);
+	{
+		int lim = t_resp_us ? tmo * 10000 / t_resp_us : tmo;
+
+		for (t = 0; t < lim; t++) {
+			rd8(0x54, &s54);
+			if (s54 & 0x10)
+				break;
+			if (t_resp_us)
+				udelay(t_resp_us);
+			else
+				msleep(10);
+		}
 	}
 	if (!(s54 & 0x10)) {
 		logf("no response, reg54=%02x after %d polls\n", s54, t);
@@ -1094,7 +1156,8 @@ static int fw_xfer(const u8 *cb, int len, u16 *rlenp, int tmo)
 	}
 	r = fw_read_resp(&rlen, 0);
 	wr8(0x56, 0x10);		/* ack bit4 */
-	msleep(2);
+	if (t_ack_ms)
+		msleep(t_ack_ms);
 	rd8(0x54, &s54);
 	logf("resp len=%04x after %d polls, read -> %d, reg54 after ack=%02x\n",
 	     rlen, t, r, s54);
@@ -1239,7 +1302,7 @@ static void parse_scan(u16 rlen)
 		hexdump(rbuf + off, rlen - off < 32 ? rlen - off : 32);
 }
 
-/* scan: same 0x48-byte command  builds (default branch) */
+/* scan: same 0x48-byte command wlan.prx FUN_0000d214 builds (default branch) */
 static void run_scan(int flag)
 {
 	static u8 cb[0x60];
@@ -1267,7 +1330,7 @@ static void run_scan(int flag)
 	}
 }
 
-/* cmd 0x11 authenticate (): bssid[6] @8, u8 @14 = shared-key flag, u16 LE @15 */
+/* cmd 0x11 authenticate (wlan.prx FUN_0000fb30): bssid[6] @8, u8 @14 = shared-key flag, u16 LE @15 */
 static void run_auth(int idx, int type)
 {
 	static u8 cb[0x20];
@@ -1291,7 +1354,7 @@ static void run_auth(int idx, int type)
 		show_resp(rlen, 0x20);
 }
 
-/* cmd 0x12 associate: bssid[6] @8, u16 @14 (cap), u16 @16, u16 @18, u32 @20 - meaning of last three unknown */
+/* cmd 0x12 associate (FUN_0000f8b4): bssid[6] @8, u16 @14 (cap), u16 @16, u16 @18, u32 @20 - meaning of last three unknown */
 static void run_assoc(int idx, u16 a14, u16 a16, u16 a18, u32 a20)
 {
 	static u8 cb[0x20];
@@ -1320,7 +1383,7 @@ static void run_assoc(int idx, u16 a14, u16 a16, u16 a18, u32 a20)
 		show_resp(rlen, 0x20);
 }
 
-/* ---- data path: TX = reg 0x42 len + block write @0x102; RX = reg 0x40 len + block read @0x102 ---- */
+/* ---- data path: TX = reg 0x42 len + block write @0x102; RX = reg 0x40 len + block read @0x102 (FUN_00013770 / FUN_000136b0) ---- */
 static int tx_variant;
 
 static int data_tx(const u8 *f, int len)
@@ -1464,7 +1527,7 @@ static void run_rx(int sec)
 	data_listen((sec > 0 ? sec : 10) * 1000);
 }
 
-/* cmd 0x2b = Sony ioctl 7: BSS join/config. SSID[32]@8, type@40 (1=infra), beacon u16@41,
+/* cmd 0x2b = Sony ioctl 7 (FUN_0000d578): BSS join/config. SSID[32]@8, type@40 (1=infra), beacon u16@41,
  * dtim@43, IBSS-param IE @44 (6,2,atim), DS-param IE @52 (3,1,channel), capability u16@59, basic rates @61 */
 static void run_join(int idx, int rates)
 {
@@ -1503,7 +1566,7 @@ static void run_join(int idx, int rates)
 
 
 /* ================= chip init + link (replaces the hand-written cmdx replay in auto.sh) =================
- * Every constant below comes from traces of the Sony driver talking to the chip (see docs/PROTOCOL.md). */
+ * Every constant below comes from the Sony wlan.prx trace (see NOTES.md milestones 6-12). */
 struct ccmd {
 	u8 id;
 	u16 size;
@@ -1862,7 +1925,9 @@ static void pw_poll(void)
 {
 	u8 s = 0;
 	int k;
+	unsigned long long t0;
 
+	st_polls++;
 	if (rd8(0x54, &s))
 		return;
 	if (s & 0x08) {				/* async event: code in 0x4e, ack with 0xf7 */
@@ -1888,9 +1953,13 @@ static void pw_poll(void)
 			break;
 		al = (l + 3) & ~3;
 		memset(pw_rxbuf, 0, al);
+		t0 = now_us();
 		ms_dma_mode(0);
 		r = blk_read(pw_rxbuf, al, 0x102, 0xb3);
 		ms_dma_mode(3);
+		st_rx_us += now_us() - t0;
+		st_rx_n++;
+		st_rx_bytes += l;
 		if (r) {
 			printk(KERN_INFO "wlan0: rx read -> %d\n", r);
 			break;
@@ -1909,6 +1978,7 @@ static void pw_tx(struct sk_buff *skb)
 {
 	struct pw_priv *pr = netdev_priv(pw_dev);
 	int n = skb->len, al, r;
+	unsigned long long t0;
 
 	if (n < 14 || n > 1514) {
 		pr->stats.tx_errors++;
@@ -1925,6 +1995,7 @@ static void pw_tx(struct sk_buff *skb)
 	pw_txbuf[13] = n >> 8;
 	memcpy(pw_txbuf + 14, skb->data, 6);	/* destination MAC */
 	memcpy(pw_txbuf + 24, skb->data, n);
+	t0 = now_us();
 	ms_dma_mode(1);
 	r = wr16(0x42, al);
 	blk_wr_addr = 0x102;
@@ -1932,6 +2003,9 @@ static void pw_tx(struct sk_buff *skb)
 		r = blk_write(pw_txbuf, al);
 	blk_wr_addr = 0x100;
 	ms_dma_mode(0);
+	st_tx_us += now_us() - t0;
+	st_tx_n++;
+	st_tx_bytes += n;
 	if (r) {
 		pr->stats.tx_errors++;
 	} else {
@@ -1947,7 +2021,7 @@ static int pw_thread(void *arg)
 		struct sk_buff *skb;
 
 		wait_event_timeout(pw_wq, !skb_queue_empty(&pw_txq) || kthread_should_stop(),
-				   msecs_to_jiffies(10));
+				   msecs_to_jiffies(t_poll_ms > 0 ? t_poll_ms : 1));
 		mutex_lock(&bus_mutex);
 		pw_poll();
 		while ((skb = skb_dequeue(&pw_txq)) != NULL) {
@@ -1956,7 +2030,10 @@ static int pw_thread(void *arg)
 				netif_wake_queue(pw_dev);
 		}
 		mutex_unlock(&bus_mutex);
-		msleep(1);
+		if (t_idle_ms)
+			msleep(t_idle_ms);
+		else
+			cond_resched();
 	}
 	return 0;
 }
@@ -2050,7 +2127,37 @@ static void run_cmd(char *cmd)
 	u8 b = 0;
 	int r;
 
-	if (!strncmp(cmd, "netup", 5)) {
+	if (!strncmp(cmd, "tune", 4)) {
+		static const struct { const char *n; int *v; } tv[] = {
+			{ "t_int_us", &t_int_us }, { "t_stop_ms", &t_stop_ms }, { "t_ack_ms", &t_ack_ms },
+			{ "t_resp_us", &t_resp_us }, { "t_poll_ms", &t_poll_ms }, { "t_idle_ms", &t_idle_ms },
+			{ "t_fw_us", &t_fw_us }, { "t_fw_wait_ms", &t_fw_wait_ms },
+		};
+		int i;
+		char *p = cmd + 4;
+
+		log_reset();
+		while (*p == ' ')
+			p++;
+		for (i = 0; i < (int)(sizeof(tv) / sizeof(tv[0])); i++) {
+			int l = strlen(tv[i].n);
+
+			if (!strncmp(p, tv[i].n, l) && (p[l] == ' ' || p[l] == '=')) {
+				*tv[i].v = simple_strtol(p + l + 1, NULL, 10);
+				break;
+			}
+		}
+		for (i = 0; i < (int)(sizeof(tv) / sizeof(tv[0])); i++)
+			logf("%s=%d ", tv[i].n, *tv[i].v);
+		logf("\n");
+	} else if (!strncmp(cmd, "stats", 5)) {
+		log_reset();
+		if (!strncmp(cmd + 5, " reset", 6))
+			st_rx_us = st_tx_us = st_rx_n = st_tx_n = st_rx_bytes = st_tx_bytes = st_polls = 0;
+		logf("polls %llu\nrx frames %llu bytes %llu time_us %llu avg_us %llu\ntx frames %llu bytes %llu time_us %llu avg_us %llu\n",
+		     st_polls, st_rx_n, st_rx_bytes, st_rx_us, avg_us(st_rx_us, st_rx_n),
+		     st_tx_n, st_tx_bytes, st_tx_us, avg_us(st_tx_us, st_tx_n));
+	} else if (!strncmp(cmd, "netup", 5)) {
 		net_up();
 	} else if (!strncmp(cmd, "chipinit", 8)) {
 		run_chipinit();
@@ -2241,6 +2348,119 @@ static int fw_read(char *page, char **start, off_t off, int count,
 	return sprintf(page, "%d bytes loaded\n", *(data ? &fwm_len : &fwh_len));
 }
 
+
+/* ================= /proc/psp_dbg: hardware poking for research from user space =================
+ *   rd <hexaddr> [nwords]     read 32-bit words at a physical address (RAM 0x08000000-0x0bffffff, I/O 0x1c000000-0x1fffffff)
+ *   wr <hexaddr> <hexval>     write one 32-bit word
+ *   cp0                       a few CP0 registers (PRId, Config, Status, Cause, Count)
+ *   mem                       the kernel's view of RAM (boot memory map, page counts)
+ * The result of the last command is read back from the same file.  A wrong address in the I/O range can
+ * still hang the machine: it is a debugging tool. */
+static char dbgbuf[3072];
+static int dbglen;
+
+static void dbgf(const char *fmt, ...)
+	__attribute__((format(printf, 1, 2)));
+
+static void dbgf(const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (dbglen >= (int)sizeof(dbgbuf) - 1)
+		return;
+	va_start(ap, fmt);
+	n = vsnprintf(dbgbuf + dbglen, sizeof(dbgbuf) - dbglen, fmt, ap);
+	va_end(ap);
+	if (n > 0)
+		dbglen += n < (int)sizeof(dbgbuf) - dbglen ? n : (int)sizeof(dbgbuf) - dbglen - 1;
+}
+
+static int dbg_addr_ok(unsigned long a)
+{
+	return (a >= 0x08000000UL && a < 0x0c000000UL) || (a >= 0x1c000000UL && a < 0x20000000UL);
+}
+
+static int dbg_write(struct file *file, const char __user *buf, unsigned long count, void *data)
+{
+	char cmd[96];
+	unsigned long n = count < sizeof(cmd) - 1 ? count : sizeof(cmd) - 1;
+	char *e;
+
+	if (copy_from_user(cmd, buf, n))
+		return -EFAULT;
+	cmd[n] = 0;
+	dbglen = 0;
+	dbgbuf[0] = 0;
+	if (!strncmp(cmd, "rd ", 3)) {
+		unsigned long a = simple_strtoul(cmd + 3, &e, 16), w = 1, i;
+
+		while (*e == ' ')
+			e++;
+		if (*e)
+			w = simple_strtoul(e, &e, 10);
+		if (w < 1 || w > 64)
+			w = 1;
+		a &= ~3UL;
+		if (!dbg_addr_ok(a) || !dbg_addr_ok(a + 4 * w - 1)) {
+			dbgf("refused: address %08lx not in RAM or I/O range\n", a);
+		} else {
+			for (i = 0; i < w; i++) {
+				if (i % 4 == 0)
+					dbgf("%s%08lx:", i ? "\n" : "", a + 4 * i);
+				dbgf(" %08x", *(volatile u32 *)(0xa0000000UL | (a + 4 * i)));
+			}
+			dbgf("\n");
+		}
+	} else if (!strncmp(cmd, "wr ", 3)) {
+		unsigned long a = simple_strtoul(cmd + 3, &e, 16), v;
+
+		while (*e == ' ')
+			e++;
+		v = simple_strtoul(e, &e, 16);
+		a &= ~3UL;
+		if (!dbg_addr_ok(a)) {
+			dbgf("refused: address %08lx not in RAM or I/O range\n", a);
+		} else {
+			*(volatile u32 *)(0xa0000000UL | a) = v;
+			SYNC();
+			dbgf("%08lx <- %08lx, now %08x\n", a, v, *(volatile u32 *)(0xa0000000UL | a));
+		}
+	} else if (!strncmp(cmd, "cp0", 3)) {
+		dbgf("PRId   %08x\nConfig %08x\nStatus %08x\nCause  %08x\nCount  %08x\nHZ %d lpj %lu\n",
+		     read_c0_prid(), read_c0_config(), read_c0_status(), read_c0_cause(), read_c0_count(),
+		     HZ, loops_per_jiffy);
+	} else if (!strncmp(cmd, "mem", 3)) {
+		int i;
+
+		for (i = 0; i < boot_mem_map.nr_map; i++)
+			dbgf("map %d: %08lx size %08lx type %ld\n", i, (unsigned long)boot_mem_map.map[i].addr,
+			     (unsigned long)boot_mem_map.map[i].size, (long)boot_mem_map.map[i].type);
+		dbgf("num_physpages %lu totalram_pages %lu max_low_pfn %lu min_low_pfn %lu PAGE_SIZE %lu\n",
+		     num_physpages, totalram_pages, max_low_pfn, min_low_pfn, (unsigned long)PAGE_SIZE);
+	} else {
+		dbgf("commands: rd A [n] | wr A V | cp0 | mem\n");
+	}
+	return count;
+}
+
+static int dbg_read(char *page, char **start, off_t off, int count, int *eof, void *data)
+{
+	int n = dbglen - off;
+
+	if (n <= 0) {
+		*eof = 1;
+		return 0;
+	}
+	if (n > count)
+		n = count;
+	else
+		*eof = 1;
+	memcpy(page, dbgbuf + off, n);
+	*start = page;
+	return n;
+}
+
 static int __init psp_wlan_probe_init(void)
 {
 	struct proc_dir_entry *e;
@@ -2261,6 +2481,11 @@ static int __init psp_wlan_probe_init(void)
 		e->data = (void *)1;
 		e->read_proc = fw_read;
 		e->write_proc = fw_write;
+	}
+	e = create_proc_entry("psp_dbg", 0600, NULL);
+	if (e) {
+		e->read_proc = dbg_read;
+		e->write_proc = dbg_write;
 	}
 	logf("ready: go | fw | rd A | wr A V | gi | off\n");
 	return 0;

@@ -1,0 +1,13 @@
+diff --git a/include/asm-mips/mach-generic/spaces.h b/include/asm-mips/mach-generic/spaces.h
+index f0061d2d..a5a8a666 100644
+--- a/include/asm-mips/mach-generic/spaces.h
++++ b/include/asm-mips/mach-generic/spaces.h
+@@ -27,7 +27,7 @@
+ /* For Sony PSP only */
+ #ifdef CONFIG_SONY_PSP
+ #define PAGE_OFFSET		    ( 0x08000000UL + CONFIG_PSP_ADDRESS_BASE )
+-#define HIGHMEM_START     ( 0x0a000000UL + CONFIG_PSP_ADDRESS_BASE )
++#define HIGHMEM_START     ( 0x0c000000UL + CONFIG_PSP_ADDRESS_BASE )   /* was 0x0a000000: all 64 MB of the PSP-2000/3000 */
+ #endif
+ 
+ /*

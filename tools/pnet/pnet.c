@@ -1,5 +1,5 @@
 /*
- * pnet (part of pspwave): tiny network helper for the PSP uClinux rootfs (no fork, no busybox applets needed).
+ * pnet: tiny network helper for the PSP uClinux rootfs (no fork, no busybox applets needed).
  *   pnet up <if>
  *   pnet addr <if> <ip> <mask>
  *   pnet gw <ip>
@@ -33,6 +33,9 @@
 #ifndef ETH_P_PAE
 #define ETH_P_PAE 0x888e
 #endif
+
+int do_serve(int argc, char **argv);
+int do_ntp(const char *server);
 
 static int ctl_sock(void)
 {
@@ -968,7 +971,7 @@ static int do_connect(const char *ifname, const char *conf)
 {
 	char ssid[40], psk[80];
 	u8 pmk[32];
-	int fails = 0;
+	int fails = 0, ntp_done = 0;
 
 	if (read_conf(conf, ssid, sizeof(ssid), psk, sizeof(psk)) < 0 && !ssid[0]) {
 		printf("connect: bad config %s (need ssid=, optional psk=)\n", conf);
@@ -997,6 +1000,8 @@ static int do_connect(const char *ifname, const char *conf)
 		gw = g_lease.gw;
 		up_t = lease_t = uptime_s();
 		LOGT("CONNECTED\n");
+		if (!ntp_done && !do_ntp(NULL))
+			ntp_done = 1;
 		while (bad < 3) {
 			sleep(5);
 			if (access("/ms0/net/simloss", F_OK) == 0) {		/* test hook */
@@ -1044,6 +1049,10 @@ int main(int argc, char **argv)
 		return do_ping(argv[2], argc > 3 ? atoi(argv[3]) : 3);
 	if (argc >= 3 && !strcmp(argv[1], "get"))
 		return do_get(argv[2], argc > 3 ? argv[3] : "/", argc > 4 ? atoi(argv[4]) : 80);
+	if (argc >= 4 && !strcmp(argv[1], "serve"))
+		return do_serve(argc - 2, argv + 2);
+	if (argc >= 2 && !strcmp(argv[1], "ntp"))
+		return do_ntp(argc > 2 ? argv[2] : NULL);
 	if (argc >= 3 && !strcmp(argv[1], "sleep")) {		/* the rootfs busybox has no sleep */
 		sleep(atoi(argv[2]));
 		return 0;

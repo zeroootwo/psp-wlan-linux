@@ -16,8 +16,12 @@ Verified on a PSP-3004 (PRO CFW; chip firmware taken from the 6.61 modules):
 * a supervisor (`pnet connect`) that finds the network by name, joins it, runs the 4-way handshake and DHCP, watches the
   gateway with ARP, and reconnects by itself after a link loss. About 9 seconds from start to "connected".
 
-Not done: TKIP, WEP, WPA3, hidden SSIDs, power saving, interrupt-driven operation (the driver polls every 10 ms, which is
-plenty for internet access but not fast), and testing on other PSP models. Expect rough edges: this is a research
+* remote access over Wi-Fi (shell, commands, file transfer: [docs/REMOTE.md](docs/REMOTE.md)), NTP time and a time zone;
+* run-time tunables that make it about 6x faster ([docs/TUNING.md](docs/TUNING.md)) and a patch that gives Linux all 64 MB of RAM;
+* `tools/autoboot`: a CFW plugin that starts the uClinux EBOOT by itself after power-on (hold L to get to the XMB instead).
+
+Not done: TKIP, WEP, WPA3, hidden SSIDs, power saving, interrupt-driven operation (the driver polls; 4-10 ms depending on the tunables, plenty for internet access
+but not fast), and testing on other PSP models. Expect rough edges: this is a research
 project that happens to work.
 
 ## How it works
@@ -45,7 +49,8 @@ vendor commands), and it does not tell the access point about a re-association w
 | `tools/fwextract/` | cut the chip firmware images out of your own PSP's firmware |
 | `tools/wlanlog/` | CFW plugin that traces Sony's driver (how the protocol was found) |
 | `card/` | the scripts and config that go on the memory stick |
-| `docs/` | [PROTOCOL](docs/PROTOCOL.md), [BUILD](docs/BUILD.md), [INSTALL](docs/INSTALL.md), [TROUBLESHOOTING](docs/TROUBLESHOOTING.md) |
+| `tools/autoboot/` | CFW plugin that launches the uClinux EBOOT right after power-on |
+| `docs/` | [PROTOCOL](docs/PROTOCOL.md), [BUILD](docs/BUILD.md), [INSTALL](docs/INSTALL.md), [REMOTE](docs/REMOTE.md), [TUNING](docs/TUNING.md), [TROUBLESHOOTING](docs/TROUBLESHOOTING.md) |
 
 ## Quick start
 
